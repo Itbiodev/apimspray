@@ -284,23 +284,6 @@ def print_error(message):
     prefix = style("[x]", TermColors.RED, TermColors.BOLD)
     print(f"{prefix} {message}")
 
-def print_mfa_enroll_alert(target, gateway_host):
-    """
-    Loud, unmissable notification: valid credentials for an account that has no
-    MFA method registered (AADSTS50079). The operator can register an MFA method
-    on this account, which typically leads to full account takeover.
-    """
-    creds = f"{target.username}:{target.password}"
-    bar = style("=" * 64, TermColors.GREEN, TermColors.BOLD)
-    label = style(" MFA ENROLLMENT AVAILABLE — POSSIBLE ACCOUNT TAKEOVER ", TermColors.GREEN, TermColors.BOLD)
-    print("\n" + bar)
-    print(label)
-    print(f"  {style('Credentials:', TermColors.BOLD)} {style(creds, TermColors.GREEN, TermColors.BOLD)}")
-    print(f"  {style('Gateway:', TermColors.BOLD)}     {gateway_host}")
-    print(f"  {style('Detail:', TermColors.BOLD)}      Password is valid and NO MFA method is registered.")
-    print(f"               An MFA method can likely be self-enrolled for this account.")
-    print(bar + "\n")
-
 def format_result_line(timestamp, target, classification):
     ts = style(f"[{timestamp}]", TermColors.DIM)
     creds = f"{target.username}:{target.password}"
@@ -361,6 +344,18 @@ def load_file_lines(path):
         return []
     with open(p, "r", encoding="utf-8") as f:
         return [line.strip() for line in f if line.strip()]
+
+def load_lines_or_value(value):
+    """
+    Resolve a --users/--passwords argument. A file with that name wins (one item
+    per line); otherwise the argument is treated as a literal inline value, e.g.
+    --passwords 'Summer2026!' sprays a single password without a wordlist file.
+    """
+    if not value:
+        return []
+    if Path(value).is_file():
+        return load_file_lines(value)
+    return [value.strip()] if value.strip() else []
 
 def get_tested_users_from_dir(results_dir):
     """Reads a previous run's results.jsonl and returns the set of tested users."""
@@ -752,10 +747,6 @@ def process_attempt(
 
     record = build_attempt_record(target, aadsts, classification, app_config, gateway_url, status_code, has_token)
 
-    # Loud notification when the account has no MFA registered yet (enrollable).
-    if aadsts == MFA_ENROLL_ERROR:
-        print_mfa_enroll_alert(target, urlparse(gateway_url).netloc)
-
     console_msg = None
     valid_view = None
     if classification.startswith("VALID"):
@@ -782,8 +773,8 @@ def main():
         formatter_class=argparse.RawTextHelpFormatter
     )
     parser.add_argument("--urls", required=False, help="Path to APIM URLs file (from apimspraycreate.py or apimsprayrotator.sh)")
-    parser.add_argument("--users", help="Path to users file")
-    parser.add_argument("--passwords", help="Path to passwords file")
+    parser.add_argument("--users", help="Path to users file, or a single username inline (file wins if it exists)")
+    parser.add_argument("--passwords", help="Path to passwords file, or a single password inline (file wins if it exists)")
     parser.add_argument("--output", default="results", help="Output directory")
     parser.add_argument("--tenant", default="common", help="Tenant ID or Domain")
     parser.add_argument("--domain", help="Append domain to users if missing")
@@ -923,7 +914,7 @@ def main():
     # Load Users/Pass
     users = []
     if args.users:
-        users = load_file_lines(args.users)
+        users = load_lines_or_value(args.users)
         users = normalize_users(users, args.domain)
         
         if args.resume:
@@ -939,7 +930,7 @@ def main():
 
     passwords = []
     if args.passwords:
-        passwords = load_file_lines(args.passwords)
+        passwords = load_lines_or_value(args.passwords)
     
     # Mode Validation
     targets = []
