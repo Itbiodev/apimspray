@@ -83,7 +83,13 @@ def parse_location_list(value):
         return []
     return [normalize_location(part) for part in value.split(",") if part.strip()]
 
-def deploy_instance(index, location, resource_group, timestamp, prefix, backend_url, product_id):
+# Operation exposed per task. spray = ROPC token endpoint, enum = GetCredentialType.
+TASK_OPERATIONS = {
+    "spray": {"operation_id": "logon", "url_template": "/common/oauth2/token", "method": "POST"},
+    "enum": {"operation_id": "getcredtype", "url_template": "/common/GetCredentialType", "method": "POST"},
+}
+
+def deploy_instance(index, location, resource_group, timestamp, prefix, backend_url, product_id, operation):
     apim_name = f"apimspray-created-apim-{timestamp}-Number-{index}"
     api_id = "oauth"
     
@@ -117,8 +123,13 @@ def deploy_instance(index, location, resource_group, timestamp, prefix, backend_
         log("info", f"[{apim_name}] Attaching API to product...")
         retry_command(f"az apim product api add --resource-group {resource_group} --service-name {apim_name} --product-id {product_id} --api-id {api_id}")
 
-        log("info", f"[{apim_name}] Creating logon operation...")
-        retry_command(f"az apim api operation create --resource-group {resource_group} --service-name {apim_name} --api-id {api_id} --operation-id logon --url-template /common/oauth2/token --method POST --display-name logon")
+        log("info", f"[{apim_name}] Creating {operation['operation_id']} operation ({operation['url_template']})...")
+        retry_command(
+            f"az apim api operation create --resource-group {resource_group} --service-name {apim_name} "
+            f"--api-id {api_id} --operation-id {operation['operation_id']} "
+            f"--url-template {operation['url_template']} --method {operation['method']} "
+            f"--display-name {operation['operation_id']}"
+        )
 
         # Get Gateway URL
         service_url = retry_command(f"az apim show --name {apim_name} --resource-group {resource_group} --query gatewayUrl -o tsv")
@@ -143,6 +154,16 @@ def main():
         ),
     )
     parser.add_argument("--prefix", default="oauth", help="API URL prefix")
+    parser.add_argument(
+        "--task",
+        choices=["spray", "enum"],
+        default="spray",
+        help=(
+            "Which operation to expose on the gateways. 'spray' -> /common/oauth2/token "
+            "(default). 'enum' -> /common/GetCredentialType for user enumeration "
+            "(use a separate --outfile, e.g. urls_enum.txt)."
+        ),
+    )
     parser.add_argument("--delete-old", action="store_true", help="Delete old resource groups")
     
     args = parser.parse_args()
@@ -193,6 +214,8 @@ def main():
     resource_group = f"apim-rotator-{timestamp}"
     backend_url = "https://login.microsoftonline.com"
     product_id = "apimspray-product"
+    operation = TASK_OPERATIONS[args.task]
+    log("info", f"Task: {args.task} -> exposing {operation['method']} {operation['url_template']}")
     
     # Cleanup
     if args.delete_old:
@@ -228,7 +251,7 @@ def main():
             for _ in range(batch_size):
                 region = target_regions[(next_index - 1) % len(target_regions)]
                 futures.append(executor.submit(
-                    deploy_instance, next_index, region, resource_group, timestamp, args.prefix, backend_url, product_id
+                    deploy_instance, next_index, region, resource_group, timestamp, args.prefix, backend_url, product_id, operation
                 ))
                 next_index += 1
 

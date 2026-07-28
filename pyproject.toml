@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "apimspray"
+version = "2.0.0"
+description = "Entra ID auth assessment toolkit routed through rotating Azure APIM gateways"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["requests"]
+
+[project.scripts]
+apimspray = "apimspray:main"
+apimspraycreate = "apimspraycreate:main"
+apimspray-upns = "generate_upns:main"
+
+# Flat single-file modules rather than a package directory.
+[tool.setuptools]
+py-modules = ["apimspray", "apimspraycreate", "generate_upns"]

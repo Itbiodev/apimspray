@@ -3,3 +3,7 @@ results/
 __pycache__/
 GEMINI.md
 .serena/
+*.egg-info/
+.venv/
+build/
+dist/
