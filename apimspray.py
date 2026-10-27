@@ -1113,7 +1113,14 @@ def main():
         if args.client_ids:
             ids_path = Path(args.client_ids)
             if ids_path.exists():
-                client_id_list = load_file_lines(args.client_ids)
+                # Allow "# label" comment lines and inline "<guid>  # name"
+                # annotations in the file (GUIDs never contain '#', so this is
+                # safe here even though load_file_lines keeps comments verbatim).
+                client_id_list = [
+                    stripped
+                    for line in load_file_lines(args.client_ids)
+                    if (stripped := line.split("#", 1)[0].strip())
+                ]
             else:
                 client_id_list = [c.strip() for c in args.client_ids.split(",") if c.strip()]
             if not client_id_list:
