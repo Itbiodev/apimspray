@@ -53,6 +53,10 @@ FOCI_CLIENTS = [
     ("d3590ed6-52b3-4102-aeff-aad2292ab01c", "Microsoft Office"),
 ]
 
+# Resource to redeem a refresh token for. Per-script (Graph vs ARM); NOT part of
+# the CI-enforced shared block, so it may differ across helpers.
+REDEEM_SCOPE = "https://graph.microsoft.com/.default offline_access"
+
 
 def _read_source(value, is_file, label):
     """Resolve a token from a literal, '-' (stdin), or a file path."""
@@ -84,7 +88,7 @@ def _try_redeem(rt, client_id, tenant):
         "grant_type": "refresh_token",
         "client_id": client_id,
         "refresh_token": rt,
-        "scope": "https://graph.microsoft.com/.default offline_access",
+        "scope": REDEEM_SCOPE,
     }
     try:
         r = requests.post(url, data=data, timeout=30)

@@ -9,12 +9,18 @@ on:
     paths:
       - "check_group_membership.py"
       - "add_to_group.py"
+      - "enum_cert_profiles.py"
+      - "add_app_credential.py"
+      - "enum_azure_rbac.py"
       - "tools/check_auth_sync.py"
       - ".github/workflows/auth-sync.yml"
   pull_request:
     paths:
       - "check_group_membership.py"
       - "add_to_group.py"
+      - "enum_cert_profiles.py"
+      - "add_app_credential.py"
+      - "enum_azure_rbac.py"
       - "tools/check_auth_sync.py"
 
 jobs:

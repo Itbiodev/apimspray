@@ -21,7 +21,8 @@ import pathlib
 import sys
 
 # Files that must share the auth block, relative to the repo root.
-SCRIPTS = ["check_group_membership.py", "add_to_group.py"]
+SCRIPTS = ["check_group_membership.py", "add_to_group.py",
+           "enum_cert_profiles.py", "add_app_credential.py", "enum_azure_rbac.py"]
 
 # Symbols (functions and module constants) that must be identical across them.
 SHARED = ["DEFAULT_FOCI_CLIENT", "FOCI_CLIENTS", "_read_source", "_try_redeem",
