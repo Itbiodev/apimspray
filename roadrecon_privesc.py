@@ -255,6 +255,30 @@ def load_group_roles(con, sps, role_id_to_value):
     for a in con.execute("SELECT principalId, id, resourceDisplayName FROM AppRoleAssignments WHERE principalType='Group'"):
         add(a["principalId"], "app", f"{role_id_to_value.get(a['id'], a['id'])} on {a['resourceDisplayName']}", None)
 
+    # Group owners: with DELEGATED Group.ReadWrite.All, a non-admin can only
+    # modify a group they OWN (or with a Groups Administrator / Directory Writers
+    # / User Administrator role). So ownership is the enabling condition for the
+    # group-write chain - annotate it.
+    users = {}
+    try:
+        for r in con.execute("SELECT objectId, userPrincipalName, displayName FROM Users"):
+            users[r["objectId"]] = r["userPrincipalName"] or r["displayName"] or r["objectId"]
+    except sqlite3.OperationalError:
+        pass
+    owners = {}
+    try:
+        for r in con.execute('SELECT "Group" AS g, "User" AS u FROM lnk_group_owner_user'):
+            owners.setdefault(r["g"], []).append(users.get(r["u"], r["u"]))
+    except sqlite3.OperationalError:
+        pass
+    try:
+        for r in con.execute('SELECT "Group" AS g, ServicePrincipal AS sp FROM lnk_group_owner_serviceprincipal'):
+            owners.setdefault(r["g"], []).append((sps.get(r["sp"], {}).get("displayName") or r["sp"]) + " [SP]")
+    except sqlite3.OperationalError:
+        pass
+    for gid, entry in out.items():
+        entry["owners"] = owners.get(gid, [])
+
     return out
 
 
@@ -291,6 +315,7 @@ def _fmt_group_targets(group_roles, want_assignable):
             "tier": _role_tier(g["roles"]),
             "dynamic": g["dynamic"],
             "rule": ((g["rule"] or "").strip()[:70]) if g["dynamic"] else None,
+            "owners": g.get("owners", []),
         }
         rows.append(row)
     return sorted(rows, key=lambda x: (x["tier"], x["name"].lower()))
@@ -387,7 +412,11 @@ def build_chains(grants, priv_sps, group_roles):
         gw_scopes = sorted({x for e in reach.values() for x in (e["scopes"] & GROUP_WRITE_SCOPES)})
         chains.append({
             "type": "group_write", "priority": 2, "vias": gw_vias, "scopes": gw_scopes, "targets": plain_targets,
-            "note": "role-assignable groups are NOT reachable with this scope; Azure RBAC group grants are invisible to roadrecon",
+            "note": ("DELEGATED Group.ReadWrite.All only writes a group you OWN or can reach via a role "
+                     "(Groups Administrator / Directory Writers / User Administrator) - see per-group owners below. "
+                     "Unconstrained group-write is the APPLICATION permission (an SP in the pivot-targets section), "
+                     "reachable only with that SP's secret. Role-assignable groups are out of reach for this scope; "
+                     "Azure RBAC group grants are invisible to roadrecon (use enum_azure_rbac.py)."),
         })
 
     for p in priv_sps:
@@ -525,6 +554,10 @@ def main():
                     last_tier = t["tier"]
                 suffix = f"   (rule: {t['rule']}...)" if t["dynamic"] else ""
                 print(f"            {t['name']}  ->  {t['roles']}{suffix}")
+                if t["owners"]:
+                    print(f"                owners (delegated add works if you land one): {', '.join(t['owners'])}")
+                else:
+                    print(f"                owners: none  (delegated add needs Groups Administrator / Directory Writers / User Administrator)")
 
     for ch in chains:
         if ch["type"] == "role_write":
