@@ -155,6 +155,7 @@ apimspray - Entra ID Assessment Tool
 options:
   -h, --help            show this help message and exit
   --urls URLS           Path to APIM URLs file (from apimspraycreate.py or apimsprayrotator.sh)
+  --direct              Connect straight to login.microsoftonline.com with no APIM gateway or proxy. Ignores --urls and never deploys Azure resources. Every attempt egresses from this host's IP, so use conservative pacing. Intended for on-site assessments from the client's own network.
   --users USERS         Path to users file
   --passwords PASSWORDS
                         Path to passwords file
@@ -178,6 +179,24 @@ options:
                         Continue the assessment even after finding valid credentials.
   --webhook WEBHOOK     Microsoft Teams webhook URL for valid-credential alerts. If omitted, falls back to the APIMSPRAY_WEBHOOK env var, then a webhook.txt file.
 ```
+
+### Direct mode (no gateway)
+
+By default apimspray routes every attempt through the rotating pool of APIM gateways in `--urls`, so each request egresses from a different Azure IP. Pass `--direct` to skip the gateways entirely and connect **straight to `login.microsoftonline.com` from this host** — no APIM deployment, no proxy, no `--urls` needed.
+
+This is for **on-site assessments where traffic should originate from the client's own network** (e.g. you're testing from inside their offices and want the attempts to look like they come from their egress IP). Since every request leaves from a single IP with no rotation, it offers no IP-based lockout/throttle evasion — **use a conservative `--pace`**.
+
+```bash
+# Spray directly from this host, no Azure resources involved
+python3 apimspray.py --direct --mode spray --users users.txt --passwords p.txt --pace low
+
+# Works with any mode, e.g. user enumeration with no gateway
+python3 apimspray.py --direct --mode validate-users --users users.txt --domain corp.com --pace low
+```
+
+- `--direct` **ignores `--urls`** (warns if both are given) and never calls Azure — nothing is deployed.
+- All attempts come from this machine's source IP, so IP-based controls (Conditional Access named locations, Smart Lockout per-IP, Identity Protection) see one origin. Pace accordingly.
+- For `validate-users`, no separate enum gateway is required — it talks to `GetCredentialType` directly.
 
 ### Modes
 

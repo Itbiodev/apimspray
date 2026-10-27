@@ -66,6 +66,11 @@ WEBHOOK_FILE = "webhook.txt"
 # User enumeration via GetCredentialType (unauthenticated: no password sent,
 # so it never counts toward Smart Lockout). IfExistsResult meaning:
 #   0/5/6 -> account exists, 1 -> does not exist, other -> unknown.
+# Direct-connection base. With --direct, requests go straight to Microsoft from
+# the current network (e.g. on-site at the client) with no APIM gateway or proxy
+# in between, so every attempt egresses from this host's own source IP.
+DIRECT_BASE_URL = "https://login.microsoftonline.com/"
+
 GETCREDTYPE_PATH = "common/GetCredentialType"
 IF_EXISTS_EXISTS = (0, 5, 6)
 IF_EXISTS_ABSENT = (1,)
@@ -865,6 +870,16 @@ def main():
         formatter_class=argparse.RawTextHelpFormatter
     )
     parser.add_argument("--urls", required=False, help="Path to APIM URLs file (from apimspraycreate.py or apimsprayrotator.sh)")
+    parser.add_argument(
+        "--direct",
+        action="store_true",
+        help=(
+            "Connect straight to login.microsoftonline.com with no APIM gateway "
+            "or proxy. Ignores --urls and never deploys Azure resources. Every "
+            "attempt egresses from this host's IP, so use conservative pacing. "
+            "Intended for on-site assessments from the client's own network."
+        ),
+    )
     parser.add_argument("--users", help="Path to users file, or a single username inline (file wins if it exists)")
     parser.add_argument("--passwords", help="Path to passwords file, or a single password inline (file wins if it exists)")
     parser.add_argument("--output", default="results", help="Output directory")
@@ -969,8 +984,18 @@ def main():
 
     args = parser.parse_args()
 
+    # Direct mode: skip the APIM URL pool entirely and target Microsoft directly.
+    if args.direct:
+        if args.urls:
+            print_warn("--direct is set; ignoring --urls and connecting straight to Microsoft.")
+        urls = [DIRECT_BASE_URL]
+        print_info(f"Direct mode: targeting {DIRECT_BASE_URL} from this host (no gateway/proxy).")
+        apim_manager = APIMManager(urls)
+    else:
+        urls = None
+
     # Handle Missing/Empty URLs
-    if not args.urls or not Path(args.urls).exists() or os.stat(args.urls).st_size == 0:
+    if not args.direct and (not args.urls or not Path(args.urls).exists() or os.stat(args.urls).st_size == 0):
         print_warn("No URLs provided or file is empty.")
         if sys.stdin.isatty():
             try:
@@ -1002,13 +1027,14 @@ def main():
             print_error("Non-interactive mode: Please provide --urls with valid file.")
             sys.exit(1)
 
-    # Load URLs
-    urls = load_file_lines(args.urls)
-    if not urls:
-        print_error("No URLs found in provided file.")
-        sys.exit(1)
-    
-    apim_manager = APIMManager(urls)
+    # Load URLs (direct mode already built the manager above)
+    if not args.direct:
+        urls = load_file_lines(args.urls)
+        if not urls:
+            print_error("No URLs found in provided file.")
+            sys.exit(1)
+
+        apim_manager = APIMManager(urls)
 
     # Load Users/Pass
     users = []
