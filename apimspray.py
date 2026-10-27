@@ -71,6 +71,10 @@ WEBHOOK_FILE = "webhook.txt"
 # in between, so every attempt egresses from this host's own source IP.
 DIRECT_BASE_URL = "https://login.microsoftonline.com/"
 
+# Minimum per-request delay (seconds) enforced in --direct mode, where all
+# traffic egresses from this host's single IP. A higher --delay overrides it.
+DIRECT_MIN_DELAY = 1.0
+
 GETCREDTYPE_PATH = "common/GetCredentialType"
 IF_EXISTS_EXISTS = (0, 5, 6)
 IF_EXISTS_ABSENT = (1,)
@@ -965,6 +969,22 @@ def main():
         help="Override the pacing profile's safe lockout threshold.",
     )
     parser.add_argument(
+        "--delay",
+        type=float,
+        default=None,
+        help=(
+            "Override the per-request delay (seconds, per worker), replacing the "
+            "pace profile's delay. The main throttle knob for --direct, where all "
+            "traffic leaves from a single IP."
+        ),
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Override the pace profile's worker/thread count.",
+    )
+    parser.add_argument(
         "--resume",
         type=str,
         help="Path to a previous results directory. Skips already tested users.",
@@ -1084,7 +1104,27 @@ def main():
     if args.safe_threshold > 0:
         pace_config["safe"] = args.safe_threshold
     pace_config["auto_throttle"] = args.auto_throttle
-    
+
+    # Explicit overrides (work in any mode).
+    if args.workers is not None:
+        pace_config["workers"] = max(1, args.workers)
+    if args.delay is not None:
+        pace_config["delay"] = max(0.0, args.delay)
+        pace_config["original_delay"] = pace_config["delay"]
+
+    # Direct-mode throttle: every request egresses from this one host, so
+    # parallel workers just burst a single IP (raising lockout/throttle/detection
+    # risk) and give no IP diversity. Force a single worker and a minimum request
+    # spacing unless the operator set an explicit, higher --delay.
+    if args.direct:
+        if pace_config["workers"] > 1:
+            print_warn(f"--direct: forcing workers 1 (was {pace_config['workers']}) — single source IP, no benefit to parallelism.")
+            pace_config["workers"] = 1
+        if pace_config["delay"] < DIRECT_MIN_DELAY:
+            print_warn(f"--direct: raising delay to {DIRECT_MIN_DELAY}s floor (was {pace_config['delay']}s). Use --delay to set a higher value.")
+            pace_config["delay"] = DIRECT_MIN_DELAY
+            pace_config["original_delay"] = DIRECT_MIN_DELAY
+
     workers = pace_config["workers"]
     base_delay = pace_config["delay"]
     
@@ -1100,9 +1140,14 @@ def main():
     else:
         print_info(f"Targets: {style(str(len(targets)), TermColors.MAGENTA, TermColors.BOLD)}")
         
-    print_info(
-        f"Gateways: {style(str(len(urls)), TermColors.MAGENTA, TermColors.BOLD)} (rotating)"
-    )
+    if args.direct:
+        print_info(
+            f"Egress: {style('direct', TermColors.MAGENTA, TermColors.BOLD)} (single host IP, no rotation)"
+        )
+    else:
+        print_info(
+            f"Gateways: {style(str(len(urls)), TermColors.MAGENTA, TermColors.BOLD)} (rotating)"
+        )
     print_info(
         f"Workers: {style(str(workers), TermColors.MAGENTA, TermColors.BOLD)}, "
         f"Delay: {style(f'{base_delay}s', TermColors.MAGENTA, TermColors.BOLD)}"
