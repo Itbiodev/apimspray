@@ -1,5 +1,8 @@
 *.txt
+*.db
+tokens*.jsonl
 results/
+uploads/
 __pycache__/
 GEMINI.md
 .serena/

@@ -89,10 +89,16 @@ By default gateways expose the ROPC token endpoint (`/common/oauth2/token`) for 
 python3 apimspraycreate.py --task enum --count 33 --outfile urls_enum.txt
 ```
 
+To spray via the **Seamless SSO autologon** vector (see [Auth vectors](#auth-vectors---method)) deploy gateways whose backend is `autologon.microsoftazuread-sso.com` with `--task autologon` — this is a different backend host, so it needs its own URL pool:
+
+```bash
+python3 apimspraycreate.py --task autologon --count 33 --outfile urls_autologon.txt
+```
+
 **apimspraycreate CLI reference:**
 
 ```text
-usage: apimspraycreate.py [-h] --outfile OUTFILE [--count COUNT] [--location LOCATION] [--prefix PREFIX] [--task {spray,enum}] [--delete-old]
+usage: apimspraycreate.py [-h] --outfile OUTFILE [--count COUNT] [--location LOCATION] [--prefix PREFIX] [--task {spray,enum,autologon}] [--delete-old]
 
 apimspraycreate - Azure APIM Deployer
 
@@ -102,7 +108,8 @@ options:
   --count COUNT         Number of instances
   --location LOCATION   Comma-separated APIM location(s) to deploy into. When provided, only those regions are used and the first location is used for the resource group.
   --prefix PREFIX       API URL prefix
-  --task {spray,enum}   Which operation to expose on the gateways. 'spray' -> /common/oauth2/token (default). 'enum' -> /common/GetCredentialType for user enumeration (use a separate --outfile, e.g. urls_enum.txt).
+  --task {spray,enum,autologon}
+                        Which operation/backend to expose on the gateways. 'spray' -> /common/oauth2/token (default). 'enum' -> /common/GetCredentialType for user enumeration (use a separate --outfile, e.g. urls_enum.txt). 'autologon' -> the Seamless-SSO WS-Trust usernamemixed endpoint on autologon.microsoftazuread-sso.com (use --outfile urls_autologon.txt; pair with apimspray --method autologon).
   --delete-old          Delete old resource groups
 ```
 
@@ -147,7 +154,7 @@ options:
 ## Usage
 
 ```text
-usage: apimspray.py [-h] [--urls URLS] [--users USERS] [--passwords PASSWORDS] [--output OUTPUT] [--tenant TENANT] [--domain DOMAIN] --mode {spray,validate,validate-users,validate-clients}
+usage: apimspray.py [-h] [--urls URLS] [--direct] [--method {oauth,autologon}] [--users USERS] [--passwords PASSWORDS] [--output OUTPUT] [--tenant TENANT] [--domain DOMAIN] --mode {spray,validate,validate-users,validate-clients}
                     [--pace {stealth,stealth-multi,low,mid,medium,high}] [--continue-on-success]
 
 apimspray - Entra ID Assessment Tool
@@ -197,6 +204,31 @@ python3 apimspray.py --direct --mode validate-users --users users.txt --domain c
 - `--direct` **ignores `--urls`** (warns if both are given) and never calls Azure — nothing is deployed.
 - All attempts come from this machine's source IP, so IP-based controls (Conditional Access named locations, Smart Lockout per-IP, Identity Protection) see one origin. Pace accordingly.
 - For `validate-users`, no separate enum gateway is required — it talks to `GetCredentialType` directly.
+
+### Auth vectors (`--method`)
+
+`spray`, `validate`, and `validate-clients` can test credentials through two different Entra endpoints. Pick one with `--method`:
+
+| `--method` | Endpoint | Backend host | Notes |
+|---|---|---|---|
+| `oauth` (default) | ROPC `/common/oauth2/token` | `login.microsoftonline.com` | Password grant against a first-party client app. Rich AADSTS signalling, MFA/CA states, real access tokens on success. |
+| `autologon` | Seamless-SSO WS-Trust `…/winauth/trust/2005/usernamemixed` | `autologon.microsoftazuread-sso.com` | Ported from [optionalCTF/SSOh-No](https://github.com/optionalCTF/SSOh-No). A valid credential returns a `DesktopSsoToken`; misses come back as ordinary AADSTS codes (`50034` no such user, `50126` bad password, `50053` lockout, `50076` MFA). Historically light on sign-in logs; IP rotation across the APIM pool is what spreads it under per-IP Smart Lockout. |
+
+Because `autologon` hits a **different backend host**, it needs its own gateway pool. Deploy it with `apimspraycreate.py --task autologon --outfile urls_autologon.txt`, then point apimspray at that list:
+
+```bash
+# Spray the Seamless SSO autologon endpoint through the rotating pool
+python3 apimspray.py --urls urls_autologon.txt --method autologon --mode spray \
+    --users users.txt --passwords common_passwords.txt --pace medium
+
+# Or straight from this host with no gateway
+python3 apimspray.py --direct --method autologon --mode spray --users users.txt --passwords p.txt --pace low
+```
+
+Notes:
+- The tenant domain in the request path is taken from each user's UPN (`user@domain`), falling back to `--tenant`/`--domain`. Give fully-qualified UPNs (or `--domain`) so the path can be built.
+- `autologon` carries no client-app dimension, so it is **not** valid with `validate-clients` (the tool errors out). `validate-users` always uses `GetCredentialType` and ignores `--method`.
+- Credentials are sent as a plaintext WS-Security `UsernameToken` over TLS — same exposure as the ROPC password grant.
 
 ### Modes
 
@@ -369,3 +401,4 @@ results/
 - **o365spray**: Logic inspiration for ROPC flow.
 - **TeamFiltration**: Design inspiration for tool structure.
 - **FireProx**: The grandfather of cloud gateway rotation techniques.
+- **[SSOh-No](https://github.com/optionalCTF/SSOh-No)** (optionalCTF): Source of the Seamless-SSO autologon (`usernamemixed` WS-Trust) enumeration/spray vector exposed via `--method autologon`.

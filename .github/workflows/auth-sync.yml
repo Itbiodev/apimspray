@@ -1,0 +1,35 @@
+name: auth-sync
+
+# Guard that the duplicated auth block stays identical across the standalone
+# Graph helpers (check_group_membership.py / add_to_group.py). See
+# tools/check_auth_sync.py for the rationale (portability over DRY).
+
+on:
+  push:
+    paths:
+      - "check_group_membership.py"
+      - "add_to_group.py"
+      - "enum_cert_profiles.py"
+      - "add_app_credential.py"
+      - "enum_azure_rbac.py"
+      - "tools/check_auth_sync.py"
+      - ".github/workflows/auth-sync.yml"
+  pull_request:
+    paths:
+      - "check_group_membership.py"
+      - "add_to_group.py"
+      - "enum_cert_profiles.py"
+      - "add_app_credential.py"
+      - "enum_azure_rbac.py"
+      - "tools/check_auth_sync.py"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify shared auth block is in sync
+        run: python3 tools/check_auth_sync.py
