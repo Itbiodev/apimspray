@@ -83,10 +83,19 @@ def parse_location_list(value):
         return []
     return [normalize_location(part) for part in value.split(",") if part.strip()]
 
-# Operation exposed per task. spray = ROPC token endpoint, enum = GetCredentialType.
+# Operation + backend exposed per task:
+#   spray     = ROPC token endpoint         (login.microsoftonline.com)
+#   enum      = GetCredentialType           (login.microsoftonline.com)
+#   autologon = Seamless-SSO WS-Trust       (autologon.microsoftazuread-sso.com)
+# autologon lives on a different backend host, so its gateways form their own URL
+# pool (deploy with --outfile urls_autologon.txt). The {domain} path segment is an
+# APIM template parameter so any tenant domain routes through to the backend.
+LOGIN_BACKEND = "https://login.microsoftonline.com"
+AUTOLOGON_BACKEND = "https://autologon.microsoftazuread-sso.com"
 TASK_OPERATIONS = {
-    "spray": {"operation_id": "logon", "url_template": "/common/oauth2/token", "method": "POST"},
-    "enum": {"operation_id": "getcredtype", "url_template": "/common/GetCredentialType", "method": "POST"},
+    "spray": {"operation_id": "logon", "url_template": "/common/oauth2/token", "method": "POST", "backend": LOGIN_BACKEND},
+    "enum": {"operation_id": "getcredtype", "url_template": "/common/GetCredentialType", "method": "POST", "backend": LOGIN_BACKEND},
+    "autologon": {"operation_id": "ssotoken", "url_template": "/{domain}/winauth/trust/2005/usernamemixed", "method": "POST", "backend": AUTOLOGON_BACKEND},
 }
 
 def deploy_instance(index, location, resource_group, timestamp, prefix, backend_url, product_id, operation):
@@ -156,12 +165,15 @@ def main():
     parser.add_argument("--prefix", default="oauth", help="API URL prefix")
     parser.add_argument(
         "--task",
-        choices=["spray", "enum"],
+        choices=["spray", "enum", "autologon"],
         default="spray",
         help=(
-            "Which operation to expose on the gateways. 'spray' -> /common/oauth2/token "
-            "(default). 'enum' -> /common/GetCredentialType for user enumeration "
-            "(use a separate --outfile, e.g. urls_enum.txt)."
+            "Which operation/backend to expose on the gateways. 'spray' -> "
+            "/common/oauth2/token (default). 'enum' -> /common/GetCredentialType for "
+            "user enumeration (use e.g. --outfile urls_enum.txt). 'autologon' -> the "
+            "Seamless-SSO WS-Trust usernamemixed endpoint on "
+            "autologon.microsoftazuread-sso.com (use --outfile urls_autologon.txt; "
+            "pair with apimspray --method autologon)."
         ),
     )
     parser.add_argument("--delete-old", action="store_true", help="Delete old resource groups")
@@ -212,9 +224,9 @@ def main():
     # Config
     timestamp = int(time.time())
     resource_group = f"apim-rotator-{timestamp}"
-    backend_url = "https://login.microsoftonline.com"
     product_id = "apimspray-product"
     operation = TASK_OPERATIONS[args.task]
+    backend_url = operation["backend"]
     log("info", f"Task: {args.task} -> exposing {operation['method']} {operation['url_template']}")
     
     # Cleanup
