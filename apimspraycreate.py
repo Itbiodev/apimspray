@@ -95,7 +95,10 @@ AUTOLOGON_BACKEND = "https://autologon.microsoftazuread-sso.com"
 TASK_OPERATIONS = {
     "spray": {"operation_id": "logon", "url_template": "/common/oauth2/token", "method": "POST", "backend": LOGIN_BACKEND},
     "enum": {"operation_id": "getcredtype", "url_template": "/common/GetCredentialType", "method": "POST", "backend": LOGIN_BACKEND},
-    "autologon": {"operation_id": "ssotoken", "url_template": "/{domain}/winauth/trust/2005/usernamemixed", "method": "POST", "backend": AUTOLOGON_BACKEND},
+    "autologon": {"operation_id": "ssotoken", "url_template": "/{domain}/winauth/trust/2005/usernamemixed", "method": "POST", "backend": AUTOLOGON_BACKEND,
+                  # APIM requires every {param} in the url-template to be declared;
+                  # the CLI does not infer them, so list domain explicitly.
+                  "template_parameters": [{"name": "domain", "type": "string", "required": "true"}]},
 }
 
 def deploy_instance(index, location, resource_group, timestamp, prefix, backend_url, product_id, operation):
@@ -133,11 +136,17 @@ def deploy_instance(index, location, resource_group, timestamp, prefix, backend_
         retry_command(f"az apim product api add --resource-group {resource_group} --service-name {apim_name} --product-id {product_id} --api-id {api_id}")
 
         log("info", f"[{apim_name}] Creating {operation['operation_id']} operation ({operation['url_template']})...")
+        # Declare any {param} tokens in the url-template; APIM rejects the
+        # operation otherwise (the CLI does not infer them from the template).
+        tp_args = "".join(
+            f" --template-parameters name={p['name']} type={p.get('type', 'string')} required={p.get('required', 'true')}"
+            for p in operation.get("template_parameters", [])
+        )
         retry_command(
             f"az apim api operation create --resource-group {resource_group} --service-name {apim_name} "
             f"--api-id {api_id} --operation-id {operation['operation_id']} "
             f"--url-template {operation['url_template']} --method {operation['method']} "
-            f"--display-name {operation['operation_id']}"
+            f"--display-name {operation['operation_id']}{tp_args}"
         )
 
         # Get Gateway URL
